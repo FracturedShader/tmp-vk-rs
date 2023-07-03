@@ -1,0 +1,14 @@
+[package]
+name = "tmp-vk-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+cgmath = { version = "0.18.0", features = ["swizzle"] }
+image = "0.24.6"
+vulkano = "0.33.0"
+vulkano-shaders = "0.33.0"
+vulkano-win = "0.33.0"
+winit = "0.28.6"
