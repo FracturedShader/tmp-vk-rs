@@ -1,13 +1,18 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
+use vulkano::device::physical::PhysicalDeviceError;
 use vulkano::device::{self, Device, DeviceCreateInfo, QueueCreateInfo, QueueFlags};
+use vulkano::image::view::ImageView;
+use vulkano::image::SwapchainImage;
+use vulkano::swapchain::{Swapchain, SwapchainCreateInfo};
 use vulkano::{
     device::physical::{PhysicalDevice, PhysicalDeviceType},
     instance::{debug::DebugUtilsMessenger, Instance, InstanceExtensions},
     swapchain::Surface,
     VulkanLibrary,
 };
+use winit::dpi::LogicalSize;
 use winit::{
     event_loop::EventLoop,
     window::{Window, WindowBuilder},
@@ -49,7 +54,13 @@ where
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct QueueFamilyIndices {
+    graphics: u32,
+    present: u32,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct QueueFamilyIndicesPartial {
     graphics: Option<u32>,
     present: Option<u32>,
@@ -59,12 +70,18 @@ impl QueueFamilyIndicesPartial {
     fn is_complete(&self) -> bool {
         self.graphics.is_some() && self.present.is_some()
     }
-}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct QueueFamilyIndices {
-    graphics: u32,
-    present: u32,
+    fn try_build(self) -> Option<QueueFamilyIndices> {
+        if let QueueFamilyIndicesPartial {
+            graphics: Some(graphics),
+            present: Some(present),
+        } = self
+        {
+            Some(QueueFamilyIndices { graphics, present })
+        } else {
+            None
+        }
+    }
 }
 
 impl QueueFamilyIndices {
@@ -86,26 +103,25 @@ impl QueueFamilyIndices {
             }
 
             if partial.is_complete() {
-                return Self::try_build_partial(partial);
+                return partial.try_build();
             }
         }
 
         None
     }
 
-    fn try_build_partial(partial: QueueFamilyIndicesPartial) -> Option<Self> {
-        if let QueueFamilyIndicesPartial {
-            graphics: Some(graphics),
-            present: Some(present),
-        } = partial
-        {
-            Some(QueueFamilyIndices { graphics, present })
+    fn sharing(self) -> vulkano::sync::Sharing<smallvec::SmallVec<[u32; 4]>> {
+        use smallvec::smallvec;
+        use vulkano::sync::Sharing;
+
+        if self.graphics == self.present {
+            Sharing::Exclusive
         } else {
-            None
+            Sharing::Concurrent(smallvec![self.graphics, self.present])
         }
     }
 
-    fn unique_create_infos(&self) -> (Vec<QueueCreateInfo>, HashMap<u32, usize>) {
+    fn unique_create_infos(self) -> (Vec<QueueCreateInfo>, HashMap<u32, usize>) {
         let mut create_infos = Vec::new();
         let mut index_map = HashMap::new();
 
@@ -127,6 +143,7 @@ impl QueueFamilyIndices {
 }
 
 type VulkanDevice = (Arc<PhysicalDevice>, QueueFamilyIndices);
+type PrioritizedDevice = PriorityItem<(u32, u32), VulkanDevice>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DeviceQueues {
@@ -136,8 +153,9 @@ struct DeviceQueues {
 
 impl DeviceQueues {
     pub fn new(
-        (device, indices): &VulkanDevice,
-        enabled_extensions: device::DeviceExtensions,
+        indices: QueueFamilyIndices,
+        device: &Arc<PhysicalDevice>,
+        enabled_extensions: &device::DeviceExtensions,
     ) -> Result<(Arc<Device>, Self), device::DeviceCreationError> {
         let (create_infos, index_map) = indices.unique_create_infos();
 
@@ -145,7 +163,7 @@ impl DeviceQueues {
             device.clone(),
             DeviceCreateInfo {
                 queue_create_infos: create_infos,
-                enabled_extensions,
+                enabled_extensions: *enabled_extensions,
                 ..Default::default()
             },
         )
@@ -184,6 +202,11 @@ struct VulkanAppContext {
     physical: Arc<PhysicalDevice>,
     logical: Arc<Device>,
     queues: DeviceQueues,
+    swapchain: Arc<Swapchain>,
+    swapchain_format: vulkano::format::Format,
+    swapchain_extent: [u32; 2],
+    swapchain_images: Vec<Arc<SwapchainImage>>,
+    swapchain_image_views: Vec<Arc<ImageView<SwapchainImage>>>,
     _window: Arc<Window>,
 }
 
@@ -199,20 +222,47 @@ impl VulkanAppContext {
             ..Default::default()
         };
 
-        let selected_device = Self::find_suitable_device(&instance, &surface, &needed_exts)
+        let (physical, indices) = Self::find_suitable_device(&instance, &surface, &needed_exts)
             .expect("It should be possible to enumerate physical devices")
             .expect("At least one suitable graphics device should exist");
 
-        let (logical, queues) = DeviceQueues::new(&selected_device, needed_exts)
+        let (logical, queues) = DeviceQueues::new(indices, &physical, &needed_exts)
             .expect("It should be possible to create a logical device");
+
+        let create_info = Self::define_swapchain(
+            &surface,
+            &physical,
+            indices,
+            window.inner_size().to_logical(window.scale_factor()),
+        )
+        .expect("It should be possible to assemble swapchain details");
+
+        let swapchain_format = create_info.image_format.unwrap();
+        let swapchain_extent = create_info.image_extent;
+
+        let (swapchain, swapchain_images) =
+            Swapchain::new(logical.clone(), surface.clone(), create_info)
+                .expect("Creating a simple swapchain should be possible");
+
+        let swapchain_image_views = swapchain_images
+            .iter()
+            .cloned()
+            .map(ImageView::new_default)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("It should be possible to create direct views of the swapchain images");
 
         Self {
             instance,
             _debug_callback: dc,
             surface,
-            physical: selected_device.0,
+            physical,
             logical,
             queues,
+            swapchain,
+            swapchain_format,
+            swapchain_extent,
+            swapchain_images,
+            swapchain_image_views,
             _window: window,
         }
     }
@@ -296,6 +346,65 @@ impl VulkanAppContext {
         .expect("It should be possible to create a basic Vulkan instance")
     }
 
+    fn define_swapchain(
+        surface: &Arc<Surface>,
+        device: &Arc<PhysicalDevice>,
+        queues: QueueFamilyIndices,
+        client_area: LogicalSize<u32>,
+    ) -> Result<SwapchainCreateInfo, PhysicalDeviceError> {
+        use vulkano::format::Format;
+        use vulkano::image::ImageUsage;
+        use vulkano::swapchain::{ColorSpace, PresentMode, SurfaceInfo};
+
+        // This application currently doesn't care about full-screen mode
+        let surface_info = SurfaceInfo::default();
+        let formats = device.surface_formats(surface, surface_info.clone())?;
+        let modes = device.surface_present_modes(surface)?.collect::<Vec<_>>();
+
+        let &(image_format, image_color_space) = formats
+            .iter()
+            .find(|&(f, cs)| *f == Format::B8G8R8A8_SRGB && *cs == ColorSpace::SrgbNonLinear)
+            .unwrap_or(&formats[0]);
+
+        let present_mode = modes
+            .into_iter()
+            .find(|&m| m == PresentMode::Mailbox)
+            .unwrap_or(PresentMode::Fifo);
+
+        let caps = device.surface_capabilities(surface, surface_info)?;
+
+        let mut image_extent = caps
+            .current_extent
+            .unwrap_or([client_area.width, client_area.height]);
+
+        for ((&vmin, &vmax), v) in caps
+            .min_image_extent
+            .iter()
+            .zip(caps.max_image_extent.iter())
+            .zip(image_extent.iter_mut())
+        {
+            *v = Ord::clamp(*v, vmin, vmax);
+        }
+
+        let mut min_image_count = caps.min_image_count + 1;
+
+        if let Some(maximum) = caps.max_image_count {
+            min_image_count = min_image_count.min(maximum);
+        }
+
+        Ok(SwapchainCreateInfo {
+            min_image_count,
+            image_format: Some(image_format),
+            image_color_space,
+            image_extent,
+            image_usage: ImageUsage::COLOR_ATTACHMENT,
+            image_sharing: queues.sharing(),
+            pre_transform: caps.current_transform,
+            present_mode,
+            ..Default::default()
+        })
+    }
+
     #[cfg(not(debug_assertions))]
     fn desired_layers(extensions: &mut InstanceExtensions, library: &VulkanLibrary) -> Vec<String> {
         Vec::new()
@@ -331,7 +440,11 @@ impl VulkanAppContext {
     ) -> Result<Option<VulkanDevice>, vulkano::VulkanError> {
         let mut heap = instance
             .enumerate_physical_devices()?
-            .filter_map(|device| Self::device_suitability(device, surface, needed_exts))
+            .filter_map(|device| {
+                Self::device_suitability(device, surface, needed_exts)
+                    .ok()
+                    .flatten()
+            })
             .collect::<BinaryHeap<_>>();
 
         Ok(heap.pop().map(PriorityItem::into_inner))
@@ -341,7 +454,22 @@ impl VulkanAppContext {
         device: Arc<PhysicalDevice>,
         surface: &Arc<Surface>,
         needed_exts: &device::DeviceExtensions,
-    ) -> Option<PriorityItem<(u32, u32), VulkanDevice>> {
+    ) -> Result<Option<PrioritizedDevice>, PhysicalDeviceError> {
+        use vulkano::swapchain::SurfaceInfo;
+
+        if !device.supported_extensions().contains(needed_exts) {
+            return Ok(None);
+        }
+
+        // This application currently doesn't care about full-screen mode
+        let surface_info = SurfaceInfo::default();
+        let formats = device.surface_formats(surface, surface_info)?;
+        let modes = device.surface_present_modes(surface)?.collect::<Vec<_>>();
+
+        if formats.is_empty() || modes.is_empty() {
+            return Ok(None);
+        }
+
         let props = device.properties();
 
         let device_score = match props.device_type {
@@ -353,15 +481,8 @@ impl VulkanAppContext {
 
         let score = device_score;
 
-        if !device.supported_extensions().contains(needed_exts) {
-            return None;
-        }
-
-        if let Some(queues) = QueueFamilyIndices::try_build(&device, surface) {
-            return Some(PriorityItem::new((score, device_score), (device, queues)));
-        }
-
-        None
+        Ok(QueueFamilyIndices::try_build(&device, surface)
+            .map(|queues| PriorityItem::new((score, device_score), (device, queues))))
     }
 }
 
@@ -373,12 +494,12 @@ struct VulkanApp {
 
 impl VulkanApp {
     pub fn new() -> Self {
-        use winit::dpi::LogicalSize;
+        use winit::dpi::PhysicalSize;
 
         let event_loop = EventLoop::new();
         let window = WindowBuilder::new()
             .with_title("Ten Minute Physics - Vulkan")
-            .with_inner_size(LogicalSize::new(WIN_WIDTH, WIN_HEIGHT))
+            .with_inner_size(PhysicalSize::new(WIN_WIDTH, WIN_HEIGHT))
             .with_resizable(false)
             .build(&event_loop)
             .expect("It should be possible to create a simple window.");
